@@ -49,6 +49,20 @@ MODE_LEGACY_SET_OVERRIDES = {
     "56000211": {0x04: 0x29},
 }
 NEW_SWING_ANGLE_STEP = 5
+BGF10000_SUBTYPE = 15
+BGF10000_SPEED_COUNT = 12
+# App presets reuse the speed field as a submode in comfort and sleep modes.
+BGF10000_PRESETS: dict[str, tuple[int, int | None]] = {
+    "normal": (0x01, None),
+    "forest": (0x04, 1),
+    "beach": (0x04, 2),
+    "countryside": (0x04, 3),
+    "baby": (0x03, 1),
+    "sleep_1": (0x03, 2),
+    "sleep_2": (0x03, 3),
+    "strong": (0x09, BGF10000_SPEED_COUNT),
+}
+BGF10000_SUBMODE_CODES = {0x03, 0x04}
 
 
 def _status_code(value: FAValue) -> int:
@@ -186,7 +200,9 @@ class MideaFADevice(MideaDevice):
                 DeviceAttributes.body_feeling_scan: None,
             },
         )
-        self._default_speed_count = 3
+        self._default_speed_count = (
+            BGF10000_SPEED_COUNT if self._uses_preset_submodes else 3
+        )
         self._speed_count: int = self._default_speed_count
         self.fa_protocol = 0
         self.set_customize(customize)
@@ -231,11 +247,18 @@ class MideaFADevice(MideaDevice):
     @property
     def preset_modes(self) -> list[str]:
         """Return a list of preset modes."""
+        if self._uses_preset_submodes:
+            return list(BGF10000_PRESETS)
         return [
             mode
             for code, mode in self._preset_mode_codes.items()
             if code != INVALID_MODE_CODE
         ]
+
+    @property
+    def _uses_preset_submodes(self) -> bool:
+        """Whether this confirmed model encodes presets using mode and speed."""
+        return self.model == "BGF10000" and self.subtype == BGF10000_SUBTYPE
 
     @property
     def _mode_codes(self) -> dict[int, str]:
@@ -383,6 +406,27 @@ class MideaFADevice(MideaDevice):
             else:
                 self._attributes[attr] = value
             new_status[str(attr)] = self._attributes[attr]
+        raw_mode = getattr(message, "mode", None)
+        if self._uses_preset_submodes and raw_mode is not None:
+            preset = next(
+                (
+                    name
+                    for name, (mode, speed) in BGF10000_PRESETS.items()
+                    if mode == raw_mode
+                    and (speed is None or speed == getattr(message, "fan_speed", None))
+                ),
+                None,
+            )
+            self._attributes[DeviceAttributes.mode] = preset
+            new_status[DeviceAttributes.mode] = preset
+            if (
+                raw_mode in BGF10000_SUBMODE_CODES
+                and self._attributes[DeviceAttributes.power]
+            ):
+                # A submode number is not a motor speed. Consumers must not
+                # display it as a speed percentage.
+                self._attributes[DeviceAttributes.fan_speed] = None
+                new_status[DeviceAttributes.fan_speed] = None
         return new_status
 
     def _legacy_angle_code(self, value: str, values: dict[int, str]) -> int | None:
@@ -675,6 +719,13 @@ class MideaFADevice(MideaDevice):
 
     def set_attribute(self, attr: str, value: bool | float | str) -> None:
         """Set an FA device attribute."""
+        if self._uses_preset_submodes:
+            if attr == DeviceAttributes.mode:
+                self.turn_on(mode=str(value))
+                return
+            if attr == DeviceAttributes.fan_speed and int(value) > 0:
+                self.turn_on(fan_speed=int(value))
+                return
         if attr in {
             DeviceAttributes.oscillate,
             DeviceAttributes.oscillation_mode,
@@ -723,6 +774,12 @@ class MideaFADevice(MideaDevice):
 
     def turn_on(self, fan_speed: int | None = None, mode: str | None = None) -> None:
         """Turn on the device."""
+        if (
+            self._uses_preset_submodes
+            and mode is not None
+            and mode not in BGF10000_PRESETS
+        ):
+            return
         message = (
             self._new_message()
             if self._effective_fa_protocol
@@ -734,6 +791,14 @@ class MideaFADevice(MideaDevice):
         mode_code = self._mode_code(str(mode))
         if mode_code is not None:
             message.mode = mode_code
+        if self._uses_preset_submodes:
+            if mode is not None:
+                message.mode, preset_speed = BGF10000_PRESETS[mode]
+                if preset_speed is not None:
+                    message.fan_speed = preset_speed
+            elif fan_speed is not None:
+                # Explicit motor-speed selection leaves comfort/sleep mode.
+                message.mode = BGF10000_PRESETS["normal"][0]
         self.build_send(message)
 
     def set_customize(self, customize: str) -> None:
