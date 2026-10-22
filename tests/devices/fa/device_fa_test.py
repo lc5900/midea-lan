@@ -1321,7 +1321,7 @@ class TestBGF10000Profile:
     def test_speed_leaves_submode(self, power: bool) -> None:
         """Test that an explicit speed selects normal wind."""
         device = self._make_device()
-        device.attributes[DeviceAttributes.power] = power
+        device._attributes[DeviceAttributes.power] = power
         with patch.object(device, "build_send") as send:
             device.set_attribute(DeviceAttributes.fan_speed, 6)
         message = send.call_args.args[0]
@@ -1379,6 +1379,22 @@ class TestBGF10000Profile:
         device.set_customize("")
         assert device.speed_count == 12
 
+    def test_partial_response_preserves_preset(self) -> None:
+        """Keep preset state when a response contains no mode or speed."""
+        device = self._make_device()
+        device._attributes[DeviceAttributes.mode] = "forest"
+        device._attributes[DeviceAttributes.fan_speed] = None
+        response = type(
+            "Response",
+            (),
+            {"message_type": MessageType.query, "error_code": 7},
+        )()
+        with patch("midealan.devices.fa.MessageFAResponse", return_value=response):
+            status = device.process_message(b"")
+        assert status == {DeviceAttributes.error_code: 7}
+        assert device.get_attribute(DeviceAttributes.mode) == "forest"
+        assert device.get_attribute(DeviceAttributes.fan_speed) is None
+
     @pytest.mark.parametrize(
         ("model", "subtype"),
         [("BGF10000", 14), ("56000211", 15), ("other", 15)],
@@ -1397,7 +1413,7 @@ class TestBGF10000Profile:
             device.set_attribute(DeviceAttributes.mode, "comfort")
         message = send.call_args.args[0]
         assert (message.mode, message.fan_speed) == (4, None)
-        device.attributes[DeviceAttributes.power] = True
+        device._attributes[DeviceAttributes.power] = True
         with patch.object(device, "build_send") as send:
             device.set_attribute(DeviceAttributes.fan_speed, 6)
         assert send.call_args.args[0].mode is None
