@@ -31,7 +31,11 @@ def _build_message(
     return bytes(header + body + bytearray([0x00]))
 
 
-def _make_device(model: str = "test_model") -> MideaFADevice:
+def _make_device(
+    model: str = "test_model",
+    subtype: int = 1,
+    customize: str = "",
+) -> MideaFADevice:
     """Build an FA test device."""
     return MideaFADevice(
         name="Test Device",
@@ -42,8 +46,8 @@ def _make_device(model: str = "test_model") -> MideaFADevice:
         key="BB",
         device_protocol=ProtocolVersion.V1,
         model=model,
-        subtype=1,
-        customize="",
+        subtype=subtype,
+        customize=customize,
     )
 
 
@@ -1229,3 +1233,174 @@ class TestMideaFADevice:
         """Test set customize with invalid JSON keeps defaults."""
         self.device.set_customize("{")
         assert self.device.speed_count == 3
+
+
+# BGF10000 subtype 15 profile tests: start
+BGF10000_PRESETS = [
+    ("normal", 1, None),
+    ("forest", 4, 1),
+    ("beach", 4, 2),
+    ("countryside", 4, 3),
+    ("baby", 3, 1),
+    ("sleep_1", 3, 2),
+    ("sleep_2", 3, 3),
+    ("strong", 9, 12),
+]
+
+
+class TestBGF10000Profile:
+    """Test the App preset profile confirmed for BGF10000 subtype 15."""
+
+    @staticmethod
+    def _make_device(
+        model: str = "BGF10000",
+        subtype: int = 15,
+        customize: str = "",
+    ) -> MideaFADevice:
+        """Build a device for model/subtype profile tests."""
+        return _make_device(model, subtype, customize)
+
+    @pytest.mark.parametrize(
+        ("preset", "mode_speed", "checksum"),
+        [
+            ("forest", "0901", "98"),
+            ("beach", "0902", "97"),
+            ("countryside", "0903", "96"),
+            ("baby", "0701", "9a"),
+            ("sleep_1", "0702", "99"),
+            ("sleep_2", "0703", "98"),
+            ("strong", "130c", "83"),
+            ("normal", "030c", "93"),
+        ],
+    )
+    def test_captured_responses(
+        self,
+        preset: str,
+        mode_speed: str,
+        checksum: str,
+    ) -> None:
+        """Decode App presets without exposing submode numbers as motor speed."""
+        device = self._make_device()
+        status = device.process_message(
+            bytes.fromhex(
+                "aa1efa0000000000000300000000"
+                f"{mode_speed}00004300000000000000ffff0200{checksum}",
+            ),
+        )
+        assert status[DeviceAttributes.mode] == preset
+        assert device.get_attribute(DeviceAttributes.mode) == preset
+        speed = 12 if preset in {"normal", "strong"} else None
+        assert status[DeviceAttributes.fan_speed] == speed
+        assert device.get_attribute(DeviceAttributes.fan_speed) == speed
+
+    @pytest.mark.parametrize(("preset", "mode", "speed"), BGF10000_PRESETS)
+    @pytest.mark.parametrize("use_turn_on", [False, True])
+    def test_combined_preset_command(
+        self,
+        preset: str,
+        mode: int,
+        speed: int | None,
+        use_turn_on: bool,
+    ) -> None:
+        """Send the preset atomically through either public control API."""
+        device = self._make_device()
+        with patch.object(device, "build_send") as send:
+            if use_turn_on:
+                device.turn_on(fan_speed=6, mode=preset)
+            else:
+                device.set_attribute(DeviceAttributes.mode, preset)
+        send.assert_called_once()
+        message = send.call_args.args[0]
+        assert message.mode == mode
+        expected_speed = 6 if use_turn_on and speed is None else speed
+        assert message.fan_speed == expected_speed
+        assert message.power is True
+        assert message.body[4:6] == bytes((1 | (mode << 1), expected_speed or 0))
+
+    @pytest.mark.parametrize("power", [False, True])
+    def test_speed_leaves_submode(self, power: bool) -> None:
+        """Test that an explicit speed selects normal wind."""
+        device = self._make_device()
+        device.attributes[DeviceAttributes.power] = power
+        with patch.object(device, "build_send") as send:
+            device.set_attribute(DeviceAttributes.fan_speed, 6)
+        message = send.call_args.args[0]
+        assert (message.mode, message.fan_speed, message.power) == (1, 6, True)
+
+    def test_plain_power_and_zero_speed(self) -> None:
+        """Preserve submodes on power commands and the existing zero-speed API."""
+        device = self._make_device()
+        with patch.object(device, "build_send") as send:
+            device.turn_on()
+        message = send.call_args.args[0]
+        assert (message.mode, message.fan_speed, message.power) == (None, None, True)
+        with patch.object(device, "build_send") as send:
+            device.set_attribute(DeviceAttributes.power, False)
+        assert send.call_args.args[0].power is False
+        with patch.object(device, "build_send") as send:
+            device.set_attribute(DeviceAttributes.fan_speed, 0)
+        send.assert_not_called()
+
+    @pytest.mark.parametrize("mode", ["comfort", "sleep", "natural", "missing"])
+    def test_unsupported_presets(self, mode: str) -> None:
+        """Ignore broad or unknown presets instead of sending wrong commands."""
+        device = self._make_device()
+        with patch.object(device, "build_send") as send:
+            device.set_attribute(DeviceAttributes.mode, mode)
+            device.turn_on(mode=mode)
+        send.assert_not_called()
+
+    def test_unknown_submode_and_power_off(self) -> None:
+        """Keep unknown submodes unknown and report zero speed while off."""
+        device = self._make_device()
+        unknown = device.process_message(
+            bytes.fromhex(
+                "aa1efa0000000000000300000000090400004300000000000000ffff020095",
+            ),
+        )
+        assert unknown[DeviceAttributes.mode] is None
+        assert unknown[DeviceAttributes.fan_speed] is None
+        off = device.process_message(
+            bytes.fromhex(
+                "aa1efa0000000000000300000000060100004300000000000000ffff02009b",
+            ),
+        )
+        assert off[DeviceAttributes.power] is False
+        assert off[DeviceAttributes.fan_speed] == 0
+        assert off[DeviceAttributes.mode] == "baby"
+
+    def test_speed_count_and_preset_options(self) -> None:
+        """Use the confirmed speed range and retain explicit overrides."""
+        device = self._make_device()
+        assert device.speed_count == 12
+        assert device.preset_modes == [item[0] for item in BGF10000_PRESETS]
+        device.set_customize('{"speed_count": 6}')
+        assert device.speed_count == 6
+        device.set_customize("")
+        assert device.speed_count == 12
+
+    @pytest.mark.parametrize(
+        ("model", "subtype"),
+        [("BGF10000", 14), ("56000211", 15), ("other", 15)],
+    )
+    def test_other_models_and_subtypes_unchanged(
+        self,
+        model: str,
+        subtype: int,
+    ) -> None:
+        """Keep generic behavior for devices outside the exact profile."""
+        device = self._make_device(model, subtype)
+        assert device.speed_count == 3
+        assert "comfort" in device.preset_modes
+        assert "forest" not in device.preset_modes
+        with patch.object(device, "build_send") as send:
+            device.set_attribute(DeviceAttributes.mode, "comfort")
+        message = send.call_args.args[0]
+        assert (message.mode, message.fan_speed) == (4, None)
+        device.attributes[DeviceAttributes.power] = True
+        with patch.object(device, "build_send") as send:
+            device.set_attribute(DeviceAttributes.fan_speed, 6)
+        assert send.call_args.args[0].mode is None
+
+
+# BGF10000 subtype 15 profile tests: end
