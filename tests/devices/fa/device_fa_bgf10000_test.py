@@ -89,8 +89,7 @@ def test_combined_preset_command(
     expected_speed = 6 if use_turn_on and speed is None else speed
     assert message.fan_speed == expected_speed
     assert message.power is True
-    if expected_speed is not None:
-        assert message.body[5] == expected_speed
+    assert message.body[4:6] == bytes((1 | (mode << 1), expected_speed or 0))
 
 
 @pytest.mark.parametrize("power", [False, True])
